@@ -1,0 +1,415 @@
+sudo tee /usr/local/bin/uriosp >/dev/null <<'SH'
+sudo tee /usr/local/bin/uriosp >/dev/null <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP="uriosp"
+
+ETC="/etc/uriosp"
+PROFILES="$ETC/profile"
+ACTIVE="$ETC/active"
+
+LOGDIR="/var/log/uriosp-logs"
+LOGFILE="$LOGDIR/uriosp.log"
+
+GROUP="uriosp"
+DEFAULT_CLOUD="${URIOSP_DEFAULT_CLOUD:-openstack}"
+STRICT_CLOUD="${URIOSP_STRICT_CLOUD:-1}"  # 1=block if YAML missing DEFAULT_CLOUD, 0=warn
+
+SESSION_PASS_ENV="URIOSP_OS_PASSWORD"
+
+die(){ echo "ERROR: $*" >&2; exit 1; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "Missing: $1"; }
+
+log(){
+  local level="$1"; shift
+  { echo "$(date -Is) level=$level user=${SUDO_USER:-$USER} msg=$*"; } >> "$LOGFILE" 2>/dev/null || true
+}
+
+ensure_layout_root(){
+  [[ $EUID -eq 0 ]] || die "This action requires root. Use sudo."
+  groupadd -f "$GROUP"
+  mkdir -p "$ETC" "$PROFILES" "$LOGDIR"
+  touch "$ACTIVE" "$LOGFILE"
+  chown -R root:"$GROUP" "$ETC" "$LOGDIR"
+  chmod 0750 "$ETC" "$PROFILES"
+  chmod 0770 "$LOGDIR"
+  chmod 0640 "$ACTIVE"
+  chmod 0660 "$LOGFILE"
+}
+
+cfg_path(){ echo "$PROFILES/$1.yaml"; }
+
+has_default_cloud(){
+  local cfg="$1" cloud="$2"
+  awk -v want="$cloud" '
+    /^clouds:[[:space:]]*$/ {inside=1; next}
+    inside && /^[[:space:]]+[A-Za-z0-9_.-]+:[[:space:]]*$/ {
+      key=$1; sub(/:$/, "", key);
+      if (key == want) { found=1; exit }
+    }
+    END { exit(found?0:1) }
+  ' "$cfg"
+}
+
+get_active(){
+  [[ -r "$ACTIVE" ]] || die "No active profile. Run: sudo $APP config <clouds.yaml>"
+  local p; p="$(tr -d '[:space:]' < "$ACTIVE")"
+  [[ -n "$p" ]] || die "Active profile empty. Re-run config."
+  echo "$p"
+}
+
+require_session_password(){
+  local val="${!SESSION_PASS_ENV-}"
+  [[ -n "$val" ]] || die "No session password loaded. Run: eval \"\$($APP auth)\""
+}
+
+run_openstack(){
+  need openstack
+  local profile cfg
+  profile="$(get_active)"
+  cfg="$(cfg_path "$profile")"
+  [[ -r "$cfg" ]] || die "Profile not readable: $cfg (add your user to group '$GROUP')"
+
+  if ! has_default_cloud "$cfg" "$DEFAULT_CLOUD"; then
+    log "WARN" "RUN profile=$profile note=missing_default_cloud cfg=$cfg"
+    if [[ "$STRICT_CLOUD" == "1" ]]; then
+      die "Active profile YAML missing clouds: $DEFAULT_CLOUD:. Refusing to run."
+    else
+      echo "WARNING: Active profile YAML missing clouds: $DEFAULT_CLOUD:. This will likely fail." >&2
+    fi
+  fi
+
+  require_session_password
+
+  OS_CLIENT_CONFIG_FILE="$cfg" \
+  OS_CLOUD="$DEFAULT_CLOUD" \
+  OS_PASSWORD="${!SESSION_PASS_ENV}" \
+  openstack "$@"
+}
+
+cmd_auth(){
+  local pw
+  read -r -s -p "OpenStack Password (session-only): " pw
+  echo >&2
+  [[ -n "$pw" ]] || die "Empty password."
+  printf 'export %s=%q\n' "$SESSION_PASS_ENV" "$pw"
+  log "INFO" "AUTH loaded session password (not persisted)"
+}
+
+cmd_config(){
+  local src="${1:-}"
+  [[ -n "$src" ]] || die "Usage: $APP config <clouds.yaml>"
+  [[ -f "$src" ]] || die "File not found: $src"
+
+  ensure_layout_root
+
+  local base profile dst
+  base="$(basename "$src")"
+  profile="${base%.*}"
+  dst="$(cfg_path "$profile")"
+
+  cp -f "$src" "$dst"
+  chown root:"$GROUP" "$dst"
+  chmod 0640 "$dst"
+
+  if ! has_default_cloud "$dst" "$DEFAULT_CLOUD"; then
+    log "WARN" "CONFIG profile=$profile note=missing_default_cloud file=$dst"
+    if [[ "$STRICT_CLOUD" == "1" ]]; then
+      die "YAML does not contain clouds: $DEFAULT_CLOUD:. Fix the file or set URIOSP_DEFAULT_CLOUD."
+    else
+      echo "WARNING: YAML missing clouds: $DEFAULT_CLOUD:. '$APP os' may fail." >&2
+    fi
+  fi
+
+  echo "$profile" > "$ACTIVE"
+  chown root:"$GROUP" "$ACTIVE"
+  chmod 0640 "$ACTIVE"
+
+  log "INFO" "CONFIG ok profile=$profile dst=$dst"
+  echo "OK: stored profile '$profile' -> $dst"
+  echo "Active profile: $profile"
+  echo "Default cloud: $DEFAULT_CLOUD"
+}
+
+cmd_use(){
+  local profile="${1:-}"
+  [[ -n "$profile" ]] || die "Usage: $APP use <profile>"
+  [[ -r "$(cfg_path "$profile")" ]] || die "Profile not found or not readable: $(cfg_path "$profile")"
+  echo "$profile" | sudo tee "$ACTIVE" >/dev/null
+  log "INFO" "USE profile=$profile"
+  echo "Active profile: $profile"
+}
+
+cmd_list(){
+  [[ -d "$PROFILES" ]] || { echo "(no profiles)"; exit 0; }
+  ls -1 "$PROFILES" 2>/dev/null | sed -n 's/\.yaml$//p' || true
+}
+
+cmd_os(){
+  log "INFO" "OS cmd=openstack $*"
+  run_openstack "$@"
+}
+
+cmd_inventory(){
+  # inventory: list ALL VMs across ALL projects (1 all-projects call, group by project_id)
+  # options:
+  #   --limit N        limit VMs printed per project (default 0=no limit)
+  #   --no-resolve     do NOT fallback to per-server show when project_id is missing
+  local limit=0
+  local resolve=1
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --limit) limit="${2:-0}"; shift 2 ;;
+      --no-resolve) resolve=0; shift ;;
+      *) die "Usage: $APP inventory [--limit N] [--no-resolve]" ;;
+    esac
+  done
+
+  need python3
+  need mktemp
+
+  # prepare env for python subprocess (so it can call `openstack server show` if needed)
+  local profile cfg
+  profile="$(get_active)"
+  cfg="$(cfg_path "$profile")"
+  [[ -r "$cfg" ]] || die "Profile not readable: $cfg (add your user to group '$GROUP')"
+  if ! has_default_cloud "$cfg" "$DEFAULT_CLOUD"; then
+    [[ "$STRICT_CLOUD" == "1" ]] && die "Active profile YAML missing clouds: $DEFAULT_CLOUD:."
+  fi
+  require_session_password
+
+  local proj_tmp srv_tmp out rc
+  proj_tmp="$(mktemp)"
+  srv_tmp="$(mktemp)"
+
+  cleanup(){
+    rm -f "$proj_tmp" "$srv_tmp" 2>/dev/null || true
+  }
+  # IMPORTANT: use RETURN so local vars are still in-scope; avoid EXIT + set -u crash
+  trap cleanup RETURN
+
+  set +e
+  out="$(run_openstack project list -f json 2>&1)"
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    log "ERROR" "INVENTORY project_list_failed rc=$rc"
+    echo "ERROR: Cannot list projects." >&2
+    echo "$out" >&2
+    exit $rc
+  fi
+  printf '%s' "$out" > "$proj_tmp"
+
+  set +e
+  out="$(run_openstack server list --all-projects --long -f json 2>&1)"
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    log "ERROR" "INVENTORY server_list_all_failed rc=$rc"
+    echo "ERROR: Cannot list servers across projects." >&2
+    echo "$out" >&2
+    echo "TIP: Try: $APP os server list --all-projects --long" >&2
+    exit $rc
+  fi
+  printf '%s' "$out" > "$srv_tmp"
+
+  env \
+    OS_CLIENT_CONFIG_FILE="$cfg" \
+    OS_CLOUD="$DEFAULT_CLOUD" \
+    OS_PASSWORD="${!SESSION_PASS_ENV}" \
+    python3 - "$proj_tmp" "$srv_tmp" "$limit" "$resolve" <<'PY'
+import sys, json, re, subprocess
+
+proj_path, srv_path, limit_s, resolve_s = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+limit = int(limit_s)
+resolve = bool(int(resolve_s))
+
+with open(proj_path, "r", encoding="utf-8") as f:
+    proj = json.load(f)
+with open(srv_path, "r", encoding="utf-8") as f:
+    srv = json.load(f)
+
+proj_map = {}
+for p in proj:
+    pid = p.get("ID") or p.get("Id") or p.get("id")
+    name = p.get("Name") or p.get("name") or ""
+    if pid:
+        proj_map[pid] = name
+
+uuid32 = re.compile(r"^[0-9a-f]{32}$", re.I)
+uuid36 = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+def pick(d, keys):
+    for k in keys:
+        v = d.get(k)
+        if v is not None and v != "":
+            return v
+    return ""
+
+def find_project_field(s):
+    # Try common keys (many OSC variants)
+    candidates = [
+        "Project ID","Project_ID","project_id","Tenant ID","tenant_id","Tenant_ID",
+        "Project","Tenant","project","tenant"
+    ]
+    for k in candidates:
+        v = s.get(k)
+        if isinstance(v, str) and v:
+            if uuid32.match(v) or uuid36.match(v):
+                return v, True
+            # might be name; still usable, but not ideal
+            return v, False
+
+    # Try fuzzy: any key containing 'project' or 'tenant'
+    for k, v in s.items():
+        if not isinstance(v, str) or not v:
+            continue
+        lk = str(k).lower()
+        if "project" in lk or "tenant" in lk:
+            if uuid32.match(v) or uuid36.match(v):
+                return v, True
+            return v, False
+
+    return "", False
+
+def server_id(s):
+    return pick(s, ["ID","Id","id"])
+
+def server_line(s):
+    sid = server_id(s)
+    name = pick(s, ["Name","name"])
+    status = pick(s, ["Status","status"])
+    nets = pick(s, ["Networks","networks"])
+    return sid, name, status, nets
+
+# First pass: try to get project from list output
+proj_for = {}
+has_any_project = False
+all_project_are_uuid = True
+
+for s in srv:
+    sid = server_id(s)
+    if not sid:
+        continue
+    val, is_uuid = find_project_field(s)
+    if val:
+        has_any_project = True
+        if not is_uuid:
+            all_project_are_uuid = False
+        proj_for[sid] = val
+
+# If project field missing, resolve via `openstack server show <id> -c project_id`
+if (not has_any_project) and resolve:
+    cache = {}
+    for s in srv:
+        sid = server_id(s)
+        if not sid:
+            continue
+        if sid in cache:
+            proj_for[sid] = cache[sid]
+            continue
+        r = subprocess.run(
+            ["openstack","server","show",sid,"-f","value","-c","project_id"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        if r.returncode == 0:
+            pid = r.stdout.strip()
+            if pid:
+                cache[sid] = pid
+                proj_for[sid] = pid
+    has_any_project = bool(proj_for)
+    all_project_are_uuid = True
+
+if not has_any_project:
+    print("="*60)
+    print("Project: (UNKNOWN)")
+    for s in srv[:limit or len(srv)]:
+        sid, n, st, nets = server_line(s)
+        print(f"  - {sid} | {n} | {st} | {nets}")
+    print("WARNING: Cannot detect project id from server list output.", file=sys.stderr)
+    print("         Re-run without --no-resolve, or upgrade openstackclient.", file=sys.stderr)
+    sys.exit(0)
+
+# Group by project key
+groups = {}
+for s in srv:
+    sid = server_id(s)
+    if not sid:
+        continue
+    pid = proj_for.get(sid, "UNKNOWN")
+    groups.setdefault(pid, []).append(s)
+
+def proj_sort_key(pid):
+    name = proj_map.get(pid, "")
+    return (name.lower(), str(pid))
+
+for pid in sorted(groups.keys(), key=proj_sort_key):
+    pname = proj_map.get(pid, "")
+    header = f"Project: {pname} ({pid})" if pname else f"Project: ({pid})"
+    print("="*60)
+    print(header)
+    count = 0
+    for s in groups[pid]:
+        count += 1
+        if limit > 0 and count > limit:
+            print(f"... (limit reached: {limit})")
+            break
+        sid, n, st, nets = server_line(s)
+        print(f"  - {sid} | {n} | {st} | {nets}")
+PY
+
+  log "INFO" "INVENTORY ok"
+}
+
+cmd_logs(){
+  [[ -r "$LOGFILE" ]] || { echo "(no logs yet or no permission)"; exit 0; }
+  tail -n 200 "$LOGFILE"
+}
+
+usage(){
+  cat <<EOF
+$APP - OpenStack ops CLI (default cloud: $DEFAULT_CLOUD)
+
+Session auth (no password stored in YAML):
+  eval "\$($APP auth)"
+
+Commands:
+  sudo $APP config <clouds.yaml>        Copy into /etc/uriosp/profile/<basename>.yaml and set active
+  $APP list                             List profiles
+  $APP use <profile>                    Switch active profile
+  $APP os <openstack ...>               Run openstack with OS_CLOUD=$DEFAULT_CLOUD (uses session password)
+  $APP inventory [--limit N] [--no-resolve]
+                                        List ALL projects and ALL VMs (uses --all-projects once, groups by project_id;
+                                        fallback to server show if project_id missing)
+  $APP logs                             Tail logs
+EOF
+}
+
+case "${1:-}" in
+  auth) shift; cmd_auth ;;
+  config) shift; cmd_config "$@" ;;
+  list) shift; cmd_list ;;
+  use) shift; cmd_use "$@" ;;
+  os) shift; cmd_os "$@" ;;
+  inventory|inv) shift; cmd_inventory "$@" ;;
+  logs) shift; cmd_logs ;;
+  -h|--help|help|"") usage ;;
+  *) die "Unknown command: $1 (use --help)" ;;
+esac
+SH
+
+sudo chmod +x /usr/local/bin/uriosp
+
+
+
+# Idempotent permission bootstrap
+sudo groupadd -f uriosp
+sudo mkdir -p /etc/uriosp/profile /var/log/uriosp-logs
+sudo touch /etc/uriosp/active /var/log/uriosp-logs/uriosp.log
+sudo chown -R root:uriosp /etc/uriosp /var/log/uriosp-logs
+sudo chmod 0750 /etc/uriosp /etc/uriosp/profile
+sudo chmod 0640 /etc/uriosp/active
+sudo chmod 0770 /var/log/uriosp-logs
+sudo chmod 0660 /var/log/uriosp-logs/uriosp.log
