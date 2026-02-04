@@ -16,6 +16,9 @@ DEFAULT_CLOUD="${URIOSP_DEFAULT_CLOUD:-openstack}"
 STRICT_CLOUD="${URIOSP_STRICT_CLOUD:-1}"  # 1=block if YAML missing DEFAULT_CLOUD, 0=warn
 SESSION_PASS_ENV="URIOSP_OS_PASSWORD"
 
+# readonly guard for `uriosp os`
+ALLOW_WRITE="${URIOSP_ALLOW_WRITE:-0}"  # 0=block mutating verbs, 1=allow
+
 die(){ echo "ERROR: $*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || die "Missing: $1"; }
 
@@ -144,7 +147,21 @@ cmd_list(){
   ls -1 "$PROFILES" 2>/dev/null | sed -n 's/\.yaml$//p' || true
 }
 
+is_dangerous_os(){
+  local tok
+  for tok in "$@"; do
+    case "$tok" in
+      create|delete|purge|set|unset|add|remove|rename|update|patch|rebuild|resize|migrate|evacuate|reboot|stop|start|pause|unpause|suspend|resume|lock|unlock)
+        return 0 ;;
+    esac
+  done
+  return 1
+}
+
 cmd_os(){
+  if [[ "$ALLOW_WRITE" != "1" ]] && is_dangerous_os "$@"; then
+    die "Blocked potentially mutating command (readonly mode). Set URIOSP_ALLOW_WRITE=1 to override."
+  fi
   log "INFO" "OS cmd=openstack $*"
   run_openstack "$@"
 }
@@ -155,32 +172,34 @@ cmd_inventory_projects(){
   need python3
   need mktemp
 
-  local profile cfg
+  local profile cfg query
   profile="$(get_active)"
   cfg="$(cfg_path "$profile")"
   [[ -r "$cfg" ]] || die "Profile not readable: $cfg (add your user to group '$GROUP')"
   require_session_password
 
-  local cfg_json_file proj_json_file ra_json_file
+  query="${*:-}"
+
+  local cfg_json_file proj_json_file
   cfg_json_file="$(mktemp)"
   proj_json_file="$(mktemp)"
-  ra_json_file="$(mktemp)"
-  # IMPORTANT: expand filenames now; do NOT reference locals later (set -u safe)
-  trap 'rm -f "'"$cfg_json_file"'" "'"$proj_json_file"'" "'"$ra_json_file"'" 2>/dev/null || true' RETURN
+  trap 'rm -f "'"$cfg_json_file"'" "'"$proj_json_file"'" 2>/dev/null || true' RETURN
 
   run_openstack configuration show -f json >"$cfg_json_file" 2>/dev/null || printf '{}' >"$cfg_json_file"
   run_openstack project list -f json >"$proj_json_file"
-  run_openstack role assignment list --names -f json >"$ra_json_file" 2>/dev/null || printf '[]' >"$ra_json_file"
 
   OS_CLIENT_CONFIG_FILE="$cfg" \
   OS_CLOUD="$DEFAULT_CLOUD" \
   OS_PASSWORD="${!SESSION_PASS_ENV}" \
-  python3 - "$profile" "$DEFAULT_CLOUD" "$cfg" "$cfg_json_file" "$proj_json_file" "$ra_json_file" <<'PY'
-import sys, json, re, shutil, datetime, os
+  python3 - "$profile" "$DEFAULT_CLOUD" "$cfg" "$cfg_json_file" "$proj_json_file" "$query" <<'PY'
+import sys, json, re, shutil, datetime
+from pathlib import Path
 
 profile, cloud = sys.argv[1], sys.argv[2]
 clouds_yaml_path = sys.argv[3]
-cfg_path, proj_path, ra_path = sys.argv[4], sys.argv[5], sys.argv[6]
+cfg_path, proj_path = sys.argv[4], sys.argv[5]
+query_raw = (sys.argv[6] or "").strip().lower()
+tokens = [t for t in query_raw.split() if t]
 
 term_cols = shutil.get_terminal_size((120, 20)).columns
 
@@ -191,137 +210,135 @@ def load_json(path, default):
   except Exception:
     return default
 
-cfg = load_json(cfg_path, {})
-projects = load_json(proj_path, [])
-ra = load_json(ra_path, [])
-
 def parse_clouds_yaml_auth_url(path, want_cloud):
   in_clouds = False
-  target_indent = None
-  auth_indent = None
   in_target = False
   in_auth = False
+  target_indent = None
+  auth_indent = None
   auth_url = ""
   region = ""
   domain = ""
 
   try:
-    with open(path, "r", encoding="utf-8") as f:
-      for raw in f:
-        line = raw.split("#", 1)[0].rstrip("\n")
-        if not line.strip():
-          continue
-        indent = len(line) - len(line.lstrip(" "))
-        s = line.strip()
+    for raw in Path(path).read_text(encoding="utf-8").splitlines():
+      line = raw.split("#",1)[0].rstrip("\n")
+      if not line.strip(): continue
+      indent = len(line) - len(line.lstrip(" "))
+      s = line.strip()
 
-        if s == "clouds:":
-          in_clouds = True
+      if s == "clouds:":
+        in_clouds = True
+        in_target = in_auth = False
+        target_indent = auth_indent = None
+        continue
+
+      if in_clouds and indent == 2 and s.endswith(":"):
+        key = s[:-1].strip()
+        in_target = (key == want_cloud)
+        target_indent = 2 if in_target else None
+        in_auth = False
+        auth_indent = None
+        continue
+
+      if in_target and target_indent is not None:
+        if indent <= target_indent:
           in_target = in_auth = False
-          target_indent = auth_indent = None
           continue
 
-        if in_clouds and indent == 2 and s.endswith(":"):
-          key = s[:-1].strip()
-          in_target = (key == want_cloud)
-          target_indent = 2 if in_target else None
-          in_auth = False
-          auth_indent = None
+        if s == "auth:" and indent == target_indent + 2:
+          in_auth = True
+          auth_indent = indent
           continue
 
-        if in_target and target_indent is not None:
-          if indent <= target_indent:
-            in_target = in_auth = False
-            continue
+        if in_auth and auth_indent is not None:
+          if indent <= auth_indent:
+            in_auth = False
+          else:
+            if s.startswith("auth_url:") and not auth_url:
+              auth_url = s.split(":",1)[1].strip().strip('"').strip("'")
+            if s.startswith("user_domain_name:") and not domain:
+              domain = s.split(":",1)[1].strip().strip('"').strip("'")
 
-          if s == "auth:" and indent == target_indent + 2:
-            in_auth = True
-            auth_indent = indent
-            continue
-
-          if in_auth and auth_indent is not None:
-            if indent <= auth_indent:
-              in_auth = False
-            else:
-              if s.startswith("auth_url:"):
-                auth_url = s.split(":", 1)[1].strip().strip('"').strip("'")
-              elif s.startswith("user_domain_name:") and not domain:
-                domain = s.split(":", 1)[1].strip().strip('"').strip("'")
-
-          if s.startswith("region_name:") and indent == target_indent + 2 and not region:
-            region = s.split(":", 1)[1].strip().strip('"').strip("'")
-          if s.startswith("user_domain_name:") and indent == target_indent + 2 and not domain:
-            domain = s.split(":", 1)[1].strip().strip('"').strip("'")
-
-    return auth_url, region, domain
+        if s.startswith("region_name:") and indent == target_indent + 2 and not region:
+          region = s.split(":",1)[1].strip().strip('"').strip("'")
+        if s.startswith("user_domain_name:") and indent == target_indent + 2 and not domain:
+          domain = s.split(":",1)[1].strip().strip('"').strip("'")
   except Exception:
-    return "", "", ""
+    pass
+
+  return auth_url, region, domain
+
+cfg = load_json(cfg_path, {})
+projects_raw = load_json(proj_path, [])
 
 region = cfg.get("region_name") or cfg.get("region") or ""
 domain = cfg.get("user_domain_name") or cfg.get("project_domain_name") or cfg.get("domain_name") or ""
 auth_url = cfg.get("auth_url") or ""
 
-# Fallback from clouds.yaml if missing
-if (not auth_url) or (not region) or (not domain):
-  y_auth_url, y_region, y_domain = parse_clouds_yaml_auth_url(clouds_yaml_path, cloud)
-  auth_url = auth_url or y_auth_url
-  region = region or y_region
-  domain = domain or y_domain
+y_auth_url, y_region, y_domain = parse_clouds_yaml_auth_url(clouds_yaml_path, cloud)
+auth_url = auth_url or y_auth_url
+region = region or y_region
+domain = domain or y_domain
 
 endpoint = ""
 m = re.match(r"^(https?://[^/]+)", auth_url or "")
 if m:
-  endpoint = m.group(1)
-  endpoint = re.sub(r":5000$", "", endpoint)
+  endpoint = re.sub(r":5000$","",m.group(1))
 
-# Users per project NAME (role assignment --names gives Project=Name)
-users_by_pname = {}
-for row in ra:
-  pname = row.get("Project") or row.get("project") or ""
-  user = row.get("User") or row.get("user") or ""
-  if not pname or not user:
-    continue
-  users_by_pname.setdefault(pname, [])
-  if user not in users_by_pname[pname]:
-    users_by_pname[pname].append(user)
-
-def status_flag(p):
+def status_text(p):
   v = p.get("Enabled", p.get("enabled", None))
-  if v in (True, "True", "true", "enabled", "Enabled", "YES", "Yes", "yes"):
-    return "E"
-  if v in (False, "False", "false", "disabled", "Disabled", "NO", "No", "no"):
-    return "D"
+  if v in (True, "True", "true", "enabled", "Enabled", "YES", "Yes", "yes", 1, "1"):
+    return "Enabled"
+  if v in (False, "False", "false", "disabled", "Disabled", "NO", "No", "no", 0, "0"):
+    return "Disabled"
   return ""
 
-headers = ["Region","Domain","Endpoint","ProjectName","ProjectID","Status","UsersTop5"]
-rows = []
-for p in projects:
+# Dedup by ProjectID
+proj_by_id = {}
+for p in projects_raw:
   pid = str(p.get("ID") or p.get("id") or "")
+  if not pid:
+    continue
+  if pid not in proj_by_id:
+    proj_by_id[pid] = p
+
+headers = ["Region","Domain","Endpoint","ProjectName","ProjectID","Status"]
+rows = []
+for pid, p in proj_by_id.items():
   pname = str(p.get("Name") or p.get("name") or "")
-  users = ",".join(users_by_pname.get(pname, [])[:5])
-  rows.append([region, domain, endpoint, pname, pid, status_flag(p), users])
+  st = status_text(p)
 
-def col_widths(headers, rows):
-  w = [len(h) for h in headers]
-  for r in rows:
-    for i, c in enumerate(r):
-      w[i] = max(w[i], len(c))
-  return w
+  if tokens:
+    hay = f"{region} {domain} {endpoint} {pname} {pid} {st}".lower()
+    if not all(t in hay for t in tokens):
+      continue
 
-w = col_widths(headers, rows)
+  rows.append([region, domain, endpoint, pname, pid, st])
+
+rows.sort(key=lambda r: (r[3].lower(), r[4]))
+
+w = [len(h) for h in headers]
+for r in rows:
+  for i, c in enumerate(r):
+    w[i] = max(w[i], len(str(c)))
+
 sep = "  "
-def fmt_row(r):
-  return sep.join(r[i].ljust(w[i]) for i in range(len(w)))
+def fmt(r):
+  return sep.join(str(r[i]).ljust(w[i]) for i in range(len(w)))
 
 title = f"URIOSP INVENTORY PROJECTS | profile={profile} | cloud={cloud} | region={region} | endpoint={endpoint} | time={datetime.datetime.now().isoformat(timespec='seconds')}"
 print(title)
-print("=" * max(term_cols, len(title)))
+line_w = max(term_cols, len(title))
+print("=" * line_w)
 
-hdr_line = fmt_row(headers)
-print(hdr_line)
-print("-" * max(term_cols, len(hdr_line)))
+hdr = fmt(headers)
+line_w = max(line_w, len(hdr))
+print(hdr)
+print("-" * line_w)
 
 for r in rows:
-  print(fmt_row(r))
+  print(fmt(r))
 PY
 }
 
@@ -329,33 +346,74 @@ cmd_inventory_vms(){
   need python3
   need mktemp
 
-  local profile cfg
+  local profile cfg query
   profile="$(get_active)"
   cfg="$(cfg_path "$profile")"
   [[ -r "$cfg" ]] || die "Profile not readable: $cfg (add your user to group '$GROUP')"
   require_session_password
 
-  local proj_json_file net_json_file srv_json_file
+  query="${*:-}"
+
+  local proj_json_file net_json_file srv_json_file vol_json_file
   proj_json_file="$(mktemp)"
   net_json_file="$(mktemp)"
   srv_json_file="$(mktemp)"
-  # IMPORTANT: expand filenames now; do NOT reference locals later (set -u safe)
-  trap 'rm -f "'"$proj_json_file"'" "'"$net_json_file"'" "'"$srv_json_file"'" 2>/dev/null || true' RETURN
+  vol_json_file="$(mktemp)"
+  trap 'rm -f "'"$proj_json_file"'" "'"$net_json_file"'" "'"$srv_json_file"'" "'"$vol_json_file"'" 2>/dev/null || true' RETURN
 
   run_openstack project list -f json >"$proj_json_file"
   run_openstack network list -f json >"$net_json_file" 2>/dev/null || printf '[]' >"$net_json_file"
-  run_openstack server list --all-projects -f json >"$srv_json_file"
+
+  # ----- CRITICAL FIX: force project fields in server list (try multiple column sets) -----
+  if run_openstack server list --all-projects --long -f json \
+      -c ID -c Name -c Status -c Networks -c "Project ID" -c Project -c "Power State" \
+      >"$srv_json_file" 2>/dev/null; then
+    :
+  elif run_openstack server list --all-projects --long -f json \
+      -c ID -c Name -c Status -c Networks -c "Project ID" -c Project \
+      >"$srv_json_file" 2>/dev/null; then
+    :
+  elif run_openstack server list --all-projects --long -f json \
+      -c ID -c Name -c Status -c Networks -c "Tenant ID" -c Tenant -c "Power State" \
+      >"$srv_json_file" 2>/dev/null; then
+    :
+  elif run_openstack server list --all-projects --long -f json \
+      -c ID -c Name -c Status -c Networks -c "Tenant ID" -c Tenant \
+      >"$srv_json_file" 2>/dev/null; then
+    :
+  elif run_openstack server list --all-projects --long -f json >"$srv_json_file" 2>/dev/null; then
+    :
+  else
+    run_openstack server list --all-projects -f json >"$srv_json_file"
+  fi
+
+  # Volume bulk list (best effort)
+  if run_openstack volume list --all-projects --long -f json >"$vol_json_file" 2>/dev/null; then
+    :
+  elif run_openstack volume list --all-projects -f json >"$vol_json_file" 2>/dev/null; then
+    :
+  elif run_openstack volume list --long -f json >"$vol_json_file" 2>/dev/null; then
+    :
+  else
+    printf '[]' >"$vol_json_file"
+  fi
 
   OS_CLIENT_CONFIG_FILE="$cfg" \
   OS_CLOUD="$DEFAULT_CLOUD" \
   OS_PASSWORD="${!SESSION_PASS_ENV}" \
-  python3 - "$profile" "$DEFAULT_CLOUD" "$proj_json_file" "$net_json_file" "$srv_json_file" <<'PY'
-import sys, json, subprocess, re, ast, shutil, datetime
+  python3 - "$profile" "$DEFAULT_CLOUD" "$proj_json_file" "$net_json_file" "$srv_json_file" "$vol_json_file" "$query" <<'PY'
+import sys, json, re, ast, shutil, datetime
 
 profile, cloud = sys.argv[1], sys.argv[2]
-proj_path, net_path, srv_path = sys.argv[3], sys.argv[4], sys.argv[5]
+proj_path, net_path, srv_path, vol_path = sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
+query_raw = (sys.argv[7] or "").strip().lower()
+tokens = [t for t in query_raw.split() if t]
 
 term_cols = shutil.get_terminal_size((120, 20)).columns
+
+UUID36 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+IPv4  = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+IPv6  = re.compile(r"\b[0-9a-f]{0,4}:[0-9a-f:]{2,}\b", re.I)
 
 def load_json(path, default):
   try:
@@ -364,39 +422,50 @@ def load_json(path, default):
   except Exception:
     return default
 
+def get_ci(row, names, default=""):
+  # case-insensitive fetch for JSON keys
+  if not isinstance(row, dict):
+    return default
+  lower = {str(k).lower(): k for k in row.keys()}
+  for n in names:
+    k = lower.get(str(n).lower())
+    if k is not None:
+      return row.get(k)
+  return default
+
 projects = load_json(proj_path, [])
 nets = load_json(net_path, [])
-servers = load_json(srv_path, [])
+servers_raw = load_json(srv_path, [])
+vols = load_json(vol_path, [])
+
+# Dedup servers by ID (avoid duplicated rows)
+seen_sid=set()
+servers=[]
+for r in servers_raw:
+  sid = get_ci(r, ["ID","id"], "")
+  sid = str(sid).strip()
+  if not sid or sid in seen_sid:
+    continue
+  seen_sid.add(sid)
+  servers.append(r)
 
 proj_name_by_id = {}
+proj_id_by_name = {}
 for p in projects:
-  pid = p.get("ID") or p.get("id")
-  name = p.get("Name") or p.get("name") or ""
-  if pid:
-    proj_name_by_id[str(pid)] = str(name)
+  pid = str(get_ci(p, ["ID","id"], "") or "").strip()
+  if not pid:
+    continue
+  name = str(get_ci(p, ["Name","name"], "") or "").strip()
+  proj_name_by_id[pid] = name
+  if name and name not in proj_id_by_name:
+    proj_id_by_name[name] = pid
 
 net_id_by_name = {}
 for n in nets:
-  name = n.get("Name") or n.get("name")
-  nid = n.get("ID") or n.get("id")
-  if name and nid:
-    net_id_by_name[str(name)] = str(nid)
-
-def sh_json(cmd):
-  r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-  if r.returncode != 0:
-    return {}
-  try:
-    return json.loads(r.stdout)
-  except Exception:
-    return {}
-
-def power_state_str(val):
-  m = {0:"NOSTATE",1:"RUNNING",3:"PAUSED",4:"SHUTDOWN",6:"CRASHED",7:"SUSPENDED"}
-  try:
-    return m.get(int(val), str(val))
-  except Exception:
-    return str(val) if val is not None else ""
+  nn = str(get_ci(n, ["Name","name"], "") or "").strip()
+  nid = str(get_ci(n, ["ID","id"], "") or "").strip()
+  if nn and nid:
+    net_id_by_name[nn] = nid
 
 def dedup(seq):
   out=[]
@@ -405,141 +474,230 @@ def dedup(seq):
       out.append(x)
   return out
 
-def parse_networks_pairs(nets_val):
+def power_state_str(val):
+  m = {0:"NOSTATE",1:"RUNNING",3:"PAUSED",4:"SHUTDOWN",6:"CRASHED",7:"SUSPENDED"}
+  try:
+    if val is None: return ""
+    if isinstance(val, str) and val.strip().isdigit():
+      return m.get(int(val.strip()), val.strip())
+    if isinstance(val, int):
+      return m.get(val, str(val))
+    return str(val)
+  except Exception:
+    return str(val) if val is not None else ""
+
+def parse_networks_pairs(val):
   pairs=[]
-  if nets_val is None:
+  if val is None:
     return pairs
 
-  if isinstance(nets_val, dict):
-    for k, v in nets_val.items():
+  if isinstance(val, dict):
+    for net, v in val.items():
+      net = str(net) if net is not None else ""
       if isinstance(v, list):
-        for ip in v:
-          if isinstance(ip, str) and ip:
-            pairs.append((ip, str(k)))
-      elif isinstance(v, str) and v:
-        pairs.append((v, str(k)))
-    return pairs
+        for it in v:
+          if isinstance(it, str):
+            ip = it.strip()
+            if ip and (IPv4.fullmatch(ip) or IPv6.fullmatch(ip)):
+              pairs.append((ip, net))
+          elif isinstance(it, dict) and it.get("addr"):
+            ip = str(it.get("addr")).strip()
+            if ip and (IPv4.fullmatch(ip) or IPv6.fullmatch(ip)):
+              pairs.append((ip, net))
+      elif isinstance(v, str):
+        ip = v.strip()
+        if ip and (IPv4.fullmatch(ip) or IPv6.fullmatch(ip)):
+          pairs.append((ip, net))
+    out=[]; seen=set()
+    for ip, nn in pairs:
+      if (ip, nn) in seen: continue
+      seen.add((ip, nn))
+      out.append((ip, nn))
+    return out
 
-  s = str(nets_val).strip()
+  s=str(val).strip()
   if not s:
-    return pairs
+    return []
 
   if s.startswith("{") and s.endswith("}"):
     try:
-      d = ast.literal_eval(s)
-      if isinstance(d, dict):
-        return parse_networks_pairs(d)
+      obj = ast.literal_eval(s)
+      if isinstance(obj, dict):
+        return parse_networks_pairs(obj)
     except Exception:
       pass
 
-  parts = [p.strip() for p in s.split(",") if p.strip()]
-  for p in parts:
-    if "=" in p:
-      k, v = p.split("=", 1)
-      k = k.strip()
-      v = v.strip()
-      for ip in re.split(r"[;\s]+", v):
+  tokens2 = [t.strip() for t in s.replace(";", ",").split(",") if t.strip()]
+  cur = ""
+  for t in tokens2:
+    if "=" in t:
+      net, rest = t.split("=", 1)
+      cur = net.strip()
+      rest = rest.strip()
+      for ip in re.split(r"\s+", rest):
         ip = ip.strip()
-        if ip:
-          pairs.append((ip, k))
+        if ip and (IPv4.fullmatch(ip) or IPv6.fullmatch(ip)):
+          pairs.append((ip, cur))
+    else:
+      ip = t.strip()
+      if ip and (IPv4.fullmatch(ip) or IPv6.fullmatch(ip)):
+        pairs.append((ip, cur))
 
   if not pairs:
-    ips = re.findall(r"\b\d{1,3}(?:\.\d{1,3}){3}\b|[0-9a-f:]{2,}", s, flags=re.I)
-    for ip in ips:
+    for ip in IPv4.findall(s):
+      pairs.append((ip, ""))
+    for ip in IPv6.findall(s):
       pairs.append((ip, ""))
 
-  out=[]
+  out=[]; seen=set()
   for ip, nn in pairs:
-    if (ip, nn) not in out:
-      out.append((ip, nn))
+    if (ip, nn) in seen: continue
+    seen.add((ip, nn))
+    out.append((ip, nn))
   return out
 
-def pairs_from_addresses(addresses):
-  pairs=[]
-  if isinstance(addresses, dict):
-    for net_name, lst in addresses.items():
-      if isinstance(lst, list):
-        for it in lst:
-          if isinstance(it, dict) and it.get("addr"):
-            pairs.append((it["addr"], net_name))
-  out=[]
-  for ip, nn in pairs:
-    if (ip, nn) not in out:
-      out.append((ip, nn))
-  return out
+def volume_label(vrow):
+  vid = str(get_ci(vrow, ["ID","id"], "") or "").strip()
+  if not vid:
+    return ""
+  name = str(get_ci(vrow, ["Name","name"], "") or "").strip()
+  size = get_ci(vrow, ["Size","size"], None)
+
+  size_s = ""
+  try:
+    if size is not None and str(size).strip() != "":
+      size_s = f"{int(size)}gb"
+  except Exception:
+    size_s = ""
+
+  # avoid 20gb:20gb(...)
+  if size_s and name and name.lower() == size_s.lower():
+    name = ""
+
+  if size_s:
+    return f"{size_s}({vid})" if not name else f"{name}:{size_s}({vid})"
+  return f"{vid}" if not name else f"{name}({vid})"
+
+def attached_server_ids(vrow):
+  keys = ["Attachments","attachments","Attached to","Attached To","attached_to","AttachedTo","attachment"]
+  raw = None
+  for k in keys:
+    v = get_ci(vrow, [k], None)
+    if v:
+      raw = v
+      break
+
+  ids=[]
+  if isinstance(raw, list):
+    for it in raw:
+      if isinstance(it, dict):
+        sid = it.get("server_id") or it.get("serverId") or it.get("server") or ""
+        if sid:
+          ids.append(str(sid))
+  elif isinstance(raw, dict):
+    sid = raw.get("server_id") or raw.get("server") or ""
+    if sid:
+      ids.append(str(sid))
+  elif isinstance(raw, str):
+    ids.extend(UUID36.findall(raw))
+  return dedup(ids)
+
+# volumes_by_server (bulk join)
+vols_by_server = {}
+for v in vols:
+  label = volume_label(v)
+  if not label:
+    continue
+  for sid in attached_server_ids(v):
+    vols_by_server.setdefault(sid, [])
+    if label not in vols_by_server[sid]:
+      vols_by_server[sid].append(label)
 
 headers = ["ProjectName","ProjectID","InstanceName","InstanceID","Volume","IP","NetworkName","NetworkID","Status","PowerState"]
 
-all_lines = []
-separators = []
+blocks=[]
 
 for row in servers:
-  sid = row.get("ID") or row.get("id")
+  sid = str(get_ci(row, ["ID","id"], "") or "").strip()
   if not sid:
     continue
-  sid = str(sid)
 
-  sname = str(row.get("Name") or row.get("name") or "")
-  status = str(row.get("Status") or row.get("status") or "")
+  sname = str(get_ci(row, ["Name","name"], "") or "").strip()
+  status = str(get_ci(row, ["Status","status"], "") or "").strip()
 
-  ip_pairs = parse_networks_pairs(row.get("Networks") or row.get("networks") or "")
+  # project id keys vary by OSC version / cloud
+  pid = get_ci(row, ["Project ID","Project_ID","project_id","Tenant ID","tenant_id","tenant"], "") or ""
+  pid = str(pid).strip()
 
-  js = sh_json(["openstack","server","show",sid,"-f","json"])
-  pid = str(js.get("project_id") or js.get("tenant_id") or "")
+  # fallback: sometimes only project NAME is available
+  if not pid:
+    p_name_only = get_ci(row, ["Project","project","Tenant","tenant"], "") or ""
+    p_name_only = str(p_name_only).strip()
+    if p_name_only:
+      pid = proj_id_by_name.get(p_name_only, "")
+
   pname = proj_name_by_id.get(pid, "") if pid else ""
-  pstate = power_state_str(js.get("OS-EXT-STS:power_state") or js.get("power_state"))
 
-  vols = js.get("volumes_attached") or []
-  vol_ids=[]
-  if isinstance(vols, list):
-    for it in vols:
-      if isinstance(it, dict) and it.get("id"):
-        vol_ids.append(str(it["id"]))
-  vol_ids = dedup(vol_ids)
+  pstate = get_ci(row, ["Power State","power_state","OS-EXT-STS:power_state"], "") or ""
+  pstate = power_state_str(pstate)
 
-  if not ip_pairs:
-    ip_pairs = pairs_from_addresses(js.get("addresses") or {})
+  nets_val = get_ci(row, ["Networks","networks"], "") or ""
+  ip_pairs = parse_networks_pairs(nets_val)
 
-  max_len = max(len(vol_ids), len(ip_pairs), 1)
+  vol_list = dedup(vols_by_server.get(sid, []))
+  max_len = max(len(vol_list), len(ip_pairs), 1)
 
+  lines=[]
   for i in range(max_len):
-    vol = vol_ids[i] if i < len(vol_ids) else ""
-    pair = ip_pairs[i] if i < len(ip_pairs) else ("","")
-    ip = pair[0] or ""
-    net_name = pair[1] or ""
-    net_id = net_id_by_name.get(net_name, "") if net_name else ""
+    vol = vol_list[i] if i < len(vol_list) else ""
+    if i < len(ip_pairs):
+      ip, net_name = ip_pairs[i]
+      net_id = net_id_by_name.get(net_name, "") if net_name else ""
+    else:
+      ip, net_name, net_id = "", "", ""
 
     if i == 0:
-      all_lines.append([pname, pid, sname, sid, vol, ip, net_name, net_id, status, str(pstate)])
+      lines.append([pname, pid, sname, sid, vol, ip, net_name, net_id, status, pstate])
     else:
-      all_lines.append(["","","","", vol, ip, net_name, net_id, "", ""])
+      lines.append(["","","","", vol, ip, net_name, net_id, "", ""])
 
-  separators.append(len(all_lines))
+  # block-level filter: all tokens must match somewhere in block
+  if tokens:
+    hay = " ".join(" ".join(str(x) for x in ln if x) for ln in lines).lower()
+    if not all(t in hay for t in tokens):
+      continue
 
-w = [len(h) for h in headers]
-for r in all_lines:
-  for i, c in enumerate(r):
-    w[i] = max(w[i], len(c))
+  blocks.append(((pname.lower(), sname.lower(), sid), lines))
 
-sep = "  "
-def fmt_row(r):
-  return sep.join(r[i].ljust(w[i]) for i in range(len(w)))
+# stable sort: group by project then instance
+blocks.sort(key=lambda x: x[0])
+
+# widths
+w=[len(h) for h in headers]
+for _, lines in blocks:
+  for r in lines:
+    for i, c in enumerate(r):
+      w[i] = max(w[i], len(str(c)))
+
+sep="  "
+def fmt(r):
+  return sep.join(str(r[i]).ljust(w[i]) for i in range(len(w)))
 
 title = f"URIOSP INVENTORY VMS | profile={profile} | cloud={cloud} | time={datetime.datetime.now().isoformat(timespec='seconds')}"
 print(title)
-print("=" * max(term_cols, len(title)))
+line_w = max(term_cols, len(title))
+print("=" * line_w)
 
-hdr_line = fmt_row(headers)
-print(hdr_line)
-print("-" * max(term_cols, len(hdr_line)))
+hdr = fmt(headers)
+line_w = max(line_w, len(hdr))
+print(hdr)
+sep_line = "-" * line_w
+print(sep_line)
 
-sep_line = "-" * max(term_cols, len(hdr_line))
-end_set = set(separators)
-
-for idx, r in enumerate(all_lines, start=1):
-  print(fmt_row(r))
-  if idx in end_set:
-    print(sep_line)
+for _, lines in blocks:
+  for r in lines:
+    print(fmt(r))
+  print(sep_line)
 PY
 }
 
@@ -552,8 +710,16 @@ cmd_inventory(){
     ""|-h|--help|help)
       cat <<EOF
 Usage:
-  $APP inventory projects
-  $APP inventory vms
+  $APP inventory projects [keyword...]
+  $APP inventory vms [keyword...]
+
+Session auth:
+  eval "\$($APP auth)"
+
+Notes:
+  - keyword search is token-based (AND): "my vm 10.10" matches blocks containing all tokens.
+  - readonly guard for '$APP os' is ON by default. Override:
+      URIOSP_ALLOW_WRITE=1 $APP os ...
 EOF
       ;;
     *) die "Unknown inventory subcommand: $sub (use: projects|vms)" ;;
@@ -577,9 +743,9 @@ Commands:
   $APP list
   $APP use <profile>
   $APP auth
-  $APP os <openstack ...>
-  $APP inventory projects
-  $APP inventory vms
+  $APP os <openstack ...>                 (readonly-guarded)
+  $APP inventory projects [keyword...]
+  $APP inventory vms [keyword...]
   $APP logs
 EOF
 }
