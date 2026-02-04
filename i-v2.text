@@ -16,8 +16,8 @@ DEFAULT_CLOUD="${URIOSP_DEFAULT_CLOUD:-openstack}"
 STRICT_CLOUD="${URIOSP_STRICT_CLOUD:-1}"  # 1=block if YAML missing DEFAULT_CLOUD, 0=warn
 SESSION_PASS_ENV="URIOSP_OS_PASSWORD"
 
-# readonly guard for `uriosp os`
-ALLOW_WRITE="${URIOSP_ALLOW_WRITE:-0}"  # 0=block mutating verbs, 1=allow
+# readonly guard for `uriosp os` (hard readonly)
+ALLOW_WRITE="0"
 
 die(){ echo "ERROR: $*" >&2; exit 1; }
 need(){ command -v "$1" >/dev/null 2>&1 || die "Missing: $1"; }
@@ -147,20 +147,26 @@ cmd_list(){
   ls -1 "$PROFILES" 2>/dev/null | sed -n 's/\.yaml$//p' || true
 }
 
-is_dangerous_os(){
-  local tok
+is_dangerous_os() {
+  local tok low
   for tok in "$@"; do
-    case "$tok" in
-      create|delete|purge|set|unset|add|remove|rename|update|patch|rebuild|resize|migrate|evacuate|reboot|stop|start|pause|unpause|suspend|resume|lock|unlock)
-        return 0 ;;
+    low="$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]')"
+    case "$low" in
+      create|delete|purge|set|unset|add|remove|rename|update|patch|replace|retype|extend|shrink|\
+      rebuild|resize|migrate|evacuate|reboot|stop|start|pause|unpause|suspend|resume|lock|unlock|\
+      attach|detach|associate|disassociate|bind|unbind|grant|revoke|approve|reject|promote|demote|\
+      enable|disable|failover|recover|reset|clear)
+        return 0
+        ;;
     esac
   done
   return 1
 }
 
 cmd_os(){
-  if [[ "$ALLOW_WRITE" != "1" ]] && is_dangerous_os "$@"; then
-    die "Blocked potentially mutating command (readonly mode). Set URIOSP_ALLOW_WRITE=1 to override."
+  # hard readonly
+  if is_dangerous_os "$@"; then
+    die "Blocked mutating command (readonly tool)."
   fi
   log "INFO" "OS cmd=openstack $*"
   run_openstack "$@"
@@ -168,17 +174,31 @@ cmd_os(){
 
 # ---------- inventory subcommands ----------
 
+# Parse "mode" + "query" for inventory
+#   inventory <type> name <value...>
+#   inventory <type> id   <value...>
+#   inventory <type> <tokens...>      (default tokens mode)
+parse_mode_query(){
+  local mode="tokens"
+  if [[ $# -ge 1 ]]; then
+    case "$1" in
+      name|id) mode="$1"; shift ;;
+    esac
+  fi
+  printf '%s\n%s\n' "$mode" "${*:-}"
+}
+
 cmd_inventory_projects(){
   need python3
   need mktemp
 
-  local profile cfg query
+  local profile cfg mode query
   profile="$(get_active)"
   cfg="$(cfg_path "$profile")"
   [[ -r "$cfg" ]] || die "Profile not readable: $cfg (add your user to group '$GROUP')"
   require_session_password
 
-  query="${*:-}"
+  { read -r mode; read -r query; } < <(parse_mode_query "$@")
 
   local cfg_json_file proj_json_file
   cfg_json_file="$(mktemp)"
@@ -191,15 +211,17 @@ cmd_inventory_projects(){
   OS_CLIENT_CONFIG_FILE="$cfg" \
   OS_CLOUD="$DEFAULT_CLOUD" \
   OS_PASSWORD="${!SESSION_PASS_ENV}" \
-  python3 - "$profile" "$DEFAULT_CLOUD" "$cfg" "$cfg_json_file" "$proj_json_file" "$query" <<'PY'
+  python3 - "$profile" "$DEFAULT_CLOUD" "$cfg" "$cfg_json_file" "$proj_json_file" "$mode" "$query" <<'PY'
 import sys, json, re, shutil, datetime
 from pathlib import Path
 
 profile, cloud = sys.argv[1], sys.argv[2]
 clouds_yaml_path = sys.argv[3]
 cfg_path, proj_path = sys.argv[4], sys.argv[5]
-query_raw = (sys.argv[6] or "").strip().lower()
-tokens = [t for t in query_raw.split() if t]
+mode = (sys.argv[6] or "tokens").strip().lower()
+query_raw = (sys.argv[7] or "").strip()
+q = query_raw.lower()
+tokens = [t for t in q.split() if t]
 
 term_cols = shutil.get_terminal_size((120, 20)).columns
 
@@ -219,7 +241,6 @@ def parse_clouds_yaml_auth_url(path, want_cloud):
   auth_url = ""
   region = ""
   domain = ""
-
   try:
     for raw in Path(path).read_text(encoding="utf-8").splitlines():
       line = raw.split("#",1)[0].rstrip("\n")
@@ -266,7 +287,6 @@ def parse_clouds_yaml_auth_url(path, want_cloud):
           domain = s.split(":",1)[1].strip().strip('"').strip("'")
   except Exception:
     pass
-
   return auth_url, region, domain
 
 cfg = load_json(cfg_path, {})
@@ -297,22 +317,39 @@ def status_text(p):
 # Dedup by ProjectID
 proj_by_id = {}
 for p in projects_raw:
-  pid = str(p.get("ID") or p.get("id") or "")
-  if not pid:
-    continue
-  if pid not in proj_by_id:
+  pid = str(p.get("ID") or p.get("id") or "").strip()
+  if pid and pid not in proj_by_id:
     proj_by_id[pid] = p
 
 headers = ["Region","Domain","Endpoint","ProjectName","ProjectID","Status"]
 rows = []
+
 for pid, p in proj_by_id.items():
-  pname = str(p.get("Name") or p.get("name") or "")
+  pname = str(p.get("Name") or p.get("name") or "").strip()
   st = status_text(p)
 
-  if tokens:
-    hay = f"{region} {domain} {endpoint} {pname} {pid} {st}".lower()
-    if not all(t in hay for t in tokens):
+  if mode == "id":
+    if not q:
       continue
+    pid_l = pid.lower()
+    if len(q) < 36:
+      if q not in pid_l:
+        continue
+    else:
+      if q != pid_l:
+        continue
+
+  elif mode == "name":
+    if not q:
+      continue
+    if q not in pname.lower():
+      continue
+
+  else:  # tokens
+    if tokens:
+      hay = f"{region} {domain} {endpoint} {pname} {pid} {st}".lower()
+      if not all(t in hay for t in tokens):
+        continue
 
   rows.append([region, domain, endpoint, pname, pid, st])
 
@@ -328,8 +365,8 @@ def fmt(r):
   return sep.join(str(r[i]).ljust(w[i]) for i in range(len(w)))
 
 title = f"URIOSP INVENTORY PROJECTS | profile={profile} | cloud={cloud} | region={region} | endpoint={endpoint} | time={datetime.datetime.now().isoformat(timespec='seconds')}"
-print(title)
 line_w = max(term_cols, len(title))
+print(title)
 print("=" * line_w)
 
 hdr = fmt(headers)
@@ -346,13 +383,13 @@ cmd_inventory_vms(){
   need python3
   need mktemp
 
-  local profile cfg query
+  local profile cfg mode query
   profile="$(get_active)"
   cfg="$(cfg_path "$profile")"
   [[ -r "$cfg" ]] || die "Profile not readable: $cfg (add your user to group '$GROUP')"
   require_session_password
 
-  query="${*:-}"
+  { read -r mode; read -r query; } < <(parse_mode_query "$@")
 
   local proj_json_file net_json_file srv_json_file vol_json_file
   proj_json_file="$(mktemp)"
@@ -364,7 +401,7 @@ cmd_inventory_vms(){
   run_openstack project list -f json >"$proj_json_file"
   run_openstack network list -f json >"$net_json_file" 2>/dev/null || printf '[]' >"$net_json_file"
 
-  # ----- CRITICAL FIX: force project fields in server list (try multiple column sets) -----
+  # Force columns to keep project fields when possible
   if run_openstack server list --all-projects --long -f json \
       -c ID -c Name -c Status -c Networks -c "Project ID" -c Project -c "Power State" \
       >"$srv_json_file" 2>/dev/null; then
@@ -387,7 +424,7 @@ cmd_inventory_vms(){
     run_openstack server list --all-projects -f json >"$srv_json_file"
   fi
 
-  # Volume bulk list (best effort)
+  # Volume bulk list (best effort; can be heavy on prod)
   if run_openstack volume list --all-projects --long -f json >"$vol_json_file" 2>/dev/null; then
     :
   elif run_openstack volume list --all-projects -f json >"$vol_json_file" 2>/dev/null; then
@@ -401,13 +438,15 @@ cmd_inventory_vms(){
   OS_CLIENT_CONFIG_FILE="$cfg" \
   OS_CLOUD="$DEFAULT_CLOUD" \
   OS_PASSWORD="${!SESSION_PASS_ENV}" \
-  python3 - "$profile" "$DEFAULT_CLOUD" "$proj_json_file" "$net_json_file" "$srv_json_file" "$vol_json_file" "$query" <<'PY'
+  python3 - "$profile" "$DEFAULT_CLOUD" "$proj_json_file" "$net_json_file" "$srv_json_file" "$vol_json_file" "$mode" "$query" <<'PY'
 import sys, json, re, ast, shutil, datetime
 
 profile, cloud = sys.argv[1], sys.argv[2]
 proj_path, net_path, srv_path, vol_path = sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
-query_raw = (sys.argv[7] or "").strip().lower()
-tokens = [t for t in query_raw.split() if t]
+mode = (sys.argv[7] or "tokens").strip().lower()
+query_raw = (sys.argv[8] or "").strip()
+q = query_raw.lower()
+tokens = [t for t in q.split() if t]
 
 term_cols = shutil.get_terminal_size((120, 20)).columns
 
@@ -423,7 +462,6 @@ def load_json(path, default):
     return default
 
 def get_ci(row, names, default=""):
-  # case-insensitive fetch for JSON keys
   if not isinstance(row, dict):
     return default
   lower = {str(k).lower(): k for k in row.keys()}
@@ -438,16 +476,14 @@ nets = load_json(net_path, [])
 servers_raw = load_json(srv_path, [])
 vols = load_json(vol_path, [])
 
-# Dedup servers by ID (avoid duplicated rows)
+# Dedup servers by ID
 seen_sid=set()
 servers=[]
 for r in servers_raw:
-  sid = get_ci(r, ["ID","id"], "")
-  sid = str(sid).strip()
-  if not sid or sid in seen_sid:
-    continue
-  seen_sid.add(sid)
-  servers.append(r)
+  sid = str(get_ci(r, ["ID","id"], "") or "").strip()
+  if sid and sid not in seen_sid:
+    seen_sid.add(sid)
+    servers.append(r)
 
 proj_name_by_id = {}
 proj_id_by_name = {}
@@ -570,7 +606,6 @@ def volume_label(vrow):
   except Exception:
     size_s = ""
 
-  # avoid 20gb:20gb(...)
   if size_s and name and name.lower() == size_s.lower():
     name = ""
 
@@ -602,7 +637,6 @@ def attached_server_ids(vrow):
     ids.extend(UUID36.findall(raw))
   return dedup(ids)
 
-# volumes_by_server (bulk join)
 vols_by_server = {}
 for v in vols:
   label = volume_label(v)
@@ -614,7 +648,6 @@ for v in vols:
       vols_by_server[sid].append(label)
 
 headers = ["ProjectName","ProjectID","InstanceName","InstanceID","Volume","IP","NetworkName","NetworkID","Status","PowerState"]
-
 blocks=[]
 
 for row in servers:
@@ -625,14 +658,11 @@ for row in servers:
   sname = str(get_ci(row, ["Name","name"], "") or "").strip()
   status = str(get_ci(row, ["Status","status"], "") or "").strip()
 
-  # project id keys vary by OSC version / cloud
   pid = get_ci(row, ["Project ID","Project_ID","project_id","Tenant ID","tenant_id","tenant"], "") or ""
   pid = str(pid).strip()
 
-  # fallback: sometimes only project NAME is available
   if not pid:
-    p_name_only = get_ci(row, ["Project","project","Tenant","tenant"], "") or ""
-    p_name_only = str(p_name_only).strip()
+    p_name_only = str(get_ci(row, ["Project","project","Tenant","tenant"], "") or "").strip()
     if p_name_only:
       pid = proj_id_by_name.get(p_name_only, "")
 
@@ -661,18 +691,34 @@ for row in servers:
     else:
       lines.append(["","","","", vol, ip, net_name, net_id, "", ""])
 
-  # block-level filter: all tokens must match somewhere in block
-  if tokens:
-    hay = " ".join(" ".join(str(x) for x in ln if x) for ln in lines).lower()
-    if not all(t in hay for t in tokens):
+  # Mode filter
+  if mode == "id":
+    if not q:
       continue
+    sid_l = sid.lower()
+    if len(q) < 36:
+      if q not in sid_l:
+        continue
+    else:
+      if q != sid_l:
+        continue
+
+  elif mode == "name":
+    if not q:
+      continue
+    if q not in sname.lower():
+      continue
+
+  else:  # tokens
+    if tokens:
+      hay = " ".join(" ".join(str(x) for x in ln if x) for ln in lines).lower()
+      if not all(t in hay for t in tokens):
+        continue
 
   blocks.append(((pname.lower(), sname.lower(), sid), lines))
 
-# stable sort: group by project then instance
 blocks.sort(key=lambda x: x[0])
 
-# widths
 w=[len(h) for h in headers]
 for _, lines in blocks:
   for r in lines:
@@ -684,8 +730,8 @@ def fmt(r):
   return sep.join(str(r[i]).ljust(w[i]) for i in range(len(w)))
 
 title = f"URIOSP INVENTORY VMS | profile={profile} | cloud={cloud} | time={datetime.datetime.now().isoformat(timespec='seconds')}"
-print(title)
 line_w = max(term_cols, len(title))
+print(title)
 print("=" * line_w)
 
 hdr = fmt(headers)
@@ -701,25 +747,29 @@ for _, lines in blocks:
 PY
 }
 
-cmd_inventory(){
+cmd_list_cmd(){
   local sub="${1:-}"
   shift || true
   case "$sub" in
-    projects) log "INFO" "INVENTORY projects"; cmd_inventory_projects "$@" ;;
-    vms)      log "INFO" "INVENTORY vms";      cmd_inventory_vms "$@" ;;
+    projects) log "INFO" "INVENTORY projects"; cmd_list_cmd_projects "$@" ;;
+    vms)      log "INFO" "INVENTORY vms";      cmd_list_cmd_vms "$@" ;;
     ""|-h|--help|help)
       cat <<EOF
 Usage:
   $APP inventory projects [keyword...]
+  $APP inventory projects name <project_name_substring>
+  $APP inventory projects id <project_uuid_or_part>
+
   $APP inventory vms [keyword...]
+  $APP inventory vms name <vm_name_substring>
+  $APP inventory vms id <instance_uuid_or_part>
 
 Session auth:
   eval "\$($APP auth)"
 
 Notes:
-  - keyword search is token-based (AND): "my vm 10.10" matches blocks containing all tokens.
-  - readonly guard for '$APP os' is ON by default. Override:
-      URIOSP_ALLOW_WRITE=1 $APP os ...
+  - Default search is token-based AND: "my vm 10.10" matches blocks containing all tokens.
+  - Readonly: '$APP os' blocks mutating verbs.
 EOF
       ;;
     *) die "Unknown inventory subcommand: $sub (use: projects|vms)" ;;
@@ -764,6 +814,7 @@ esac
 SH
 
 sudo chmod +x /usr/local/bin/uriosp
+
 
 
 
