@@ -142,7 +142,7 @@ cmd_use(){
   echo "Active profile: $profile"
 }
 
-cmd_list(){
+cmd_list_profiles(){
   [[ -d "$PROFILES" ]] || { echo "(no profiles)"; exit 0; }
   ls -1 "$PROFILES" 2>/dev/null | sed -n 's/\.yaml$//p' || true
 }
@@ -156,8 +156,7 @@ is_dangerous_os() {
       rebuild|resize|migrate|evacuate|reboot|stop|start|pause|unpause|suspend|resume|lock|unlock|\
       attach|detach|associate|disassociate|bind|unbind|grant|revoke|approve|reject|promote|demote|\
       enable|disable|failover|recover|reset|clear)
-        return 0
-        ;;
+        return 0 ;;
     esac
   done
   return 1
@@ -172,13 +171,10 @@ cmd_os(){
   run_openstack "$@"
 }
 
-# ---------- inventory subcommands ----------
+# ---------- list subcommands ----------
 
-# Parse "mode" + "query" for inventory
-#   inventory <type> name <value...>
-#   inventory <type> id   <value...>
-#   inventory <type> <tokens...>      (default tokens mode)
-parse_mode_query(){
+# projects: list projects [name|id] <value...>  OR list projects <tokens...>
+parse_mode_query_projects(){
   local mode="tokens"
   if [[ $# -ge 1 ]]; then
     case "$1" in
@@ -188,7 +184,20 @@ parse_mode_query(){
   printf '%s\n%s\n' "$mode" "${*:-}"
 }
 
-cmd_inventory_projects(){
+# vms: list vms [name|id|vol] <value...>  OR list vms <tokens...>
+# 'vol' == volume id (uuid or partial). Keep 'volid' as alias.
+parse_mode_query_vms(){
+  local mode="tokens"
+  if [[ $# -ge 1 ]]; then
+    case "$1" in
+      name|id|vol) mode="$1"; shift ;;
+      volid|volume-id) mode="vol"; shift ;;
+    esac
+  fi
+  printf '%s\n%s\n' "$mode" "${*:-}"
+}
+
+cmd_list_projects(){
   need python3
   need mktemp
 
@@ -198,7 +207,7 @@ cmd_inventory_projects(){
   [[ -r "$cfg" ]] || die "Profile not readable: $cfg (add your user to group '$GROUP')"
   require_session_password
 
-  { read -r mode; read -r query; } < <(parse_mode_query "$@")
+  { read -r mode; read -r query; } < <(parse_mode_query_projects "$@")
 
   local cfg_json_file proj_json_file
   cfg_json_file="$(mktemp)"
@@ -224,6 +233,13 @@ q = query_raw.lower()
 tokens = [t for t in q.split() if t]
 
 term_cols = shutil.get_terminal_size((120, 20)).columns
+HEX = re.compile(r"[0-9a-f]", re.I)
+
+def norm_id(s: str) -> str:
+  s = (s or "").strip().lower()
+  s = s.replace("-", "")
+  s = "".join(ch for ch in s if HEX.match(ch))
+  return s
 
 def load_json(path, default):
   try:
@@ -233,18 +249,14 @@ def load_json(path, default):
     return default
 
 def parse_clouds_yaml_auth_url(path, want_cloud):
-  in_clouds = False
-  in_target = False
-  in_auth = False
-  target_indent = None
-  auth_indent = None
-  auth_url = ""
-  region = ""
-  domain = ""
+  in_clouds = in_target = in_auth = False
+  target_indent = auth_indent = None
+  auth_url = region = domain = ""
   try:
     for raw in Path(path).read_text(encoding="utf-8").splitlines():
       line = raw.split("#",1)[0].rstrip("\n")
-      if not line.strip(): continue
+      if not line.strip():
+        continue
       indent = len(line) - len(line.lstrip(" "))
       s = line.strip()
 
@@ -321,6 +333,8 @@ for p in projects_raw:
   if pid and pid not in proj_by_id:
     proj_by_id[pid] = p
 
+q_norm = norm_id(q)
+
 headers = ["Region","Domain","Endpoint","ProjectName","ProjectID","Status"]
 rows = []
 
@@ -329,14 +343,14 @@ for pid, p in proj_by_id.items():
   st = status_text(p)
 
   if mode == "id":
-    if not q:
+    if not q_norm:
       continue
-    pid_l = pid.lower()
-    if len(q) < 36:
-      if q not in pid_l:
+    pid_norm = norm_id(pid)
+    if len(q_norm) < len(pid_norm):
+      if q_norm not in pid_norm:
         continue
     else:
-      if q != pid_l:
+      if q_norm != pid_norm:
         continue
 
   elif mode == "name":
@@ -364,7 +378,7 @@ sep = "  "
 def fmt(r):
   return sep.join(str(r[i]).ljust(w[i]) for i in range(len(w)))
 
-title = f"URIOSP INVENTORY PROJECTS | profile={profile} | cloud={cloud} | region={region} | endpoint={endpoint} | time={datetime.datetime.now().isoformat(timespec='seconds')}"
+title = f"URIOSP LIST PROJECTS | profile={profile} | cloud={cloud} | region={region} | endpoint={endpoint} | time={datetime.datetime.now().isoformat(timespec='seconds')}"
 line_w = max(term_cols, len(title))
 print(title)
 print("=" * line_w)
@@ -379,7 +393,7 @@ for r in rows:
 PY
 }
 
-cmd_inventory_vms(){
+cmd_list_vms(){
   need python3
   need mktemp
 
@@ -389,7 +403,7 @@ cmd_inventory_vms(){
   [[ -r "$cfg" ]] || die "Profile not readable: $cfg (add your user to group '$GROUP')"
   require_session_password
 
-  { read -r mode; read -r query; } < <(parse_mode_query "$@")
+  { read -r mode; read -r query; } < <(parse_mode_query_vms "$@")
 
   local proj_json_file net_json_file srv_json_file vol_json_file
   proj_json_file="$(mktemp)"
@@ -450,9 +464,21 @@ tokens = [t for t in q.split() if t]
 
 term_cols = shutil.get_terminal_size((120, 20)).columns
 
-UUID36 = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+UUID36 = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+UUID32 = r"[0-9a-f]{32}"
+ANY_UUID = re.compile(rf"(?:{UUID36}|{UUID32})", re.I)
+
 IPv4  = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 IPv6  = re.compile(r"\b[0-9a-f]{0,4}:[0-9a-f:]{2,}\b", re.I)
+
+HEX = re.compile(r"[0-9a-f]", re.I)
+
+def norm_id(s: str) -> str:
+  s = (s or "").strip().lower().replace("-", "")
+  s = "".join(ch for ch in s if HEX.match(ch))
+  return s
+
+q_norm = norm_id(q)
 
 def load_json(path, default):
   try:
@@ -476,13 +502,14 @@ nets = load_json(net_path, [])
 servers_raw = load_json(srv_path, [])
 vols = load_json(vol_path, [])
 
-# Dedup servers by ID
+# Dedup servers by ID (normalized)
 seen_sid=set()
 servers=[]
 for r in servers_raw:
   sid = str(get_ci(r, ["ID","id"], "") or "").strip()
-  if sid and sid not in seen_sid:
-    seen_sid.add(sid)
+  sid_n = norm_id(sid)
+  if sid_n and sid_n not in seen_sid:
+    seen_sid.add(sid_n)
     servers.append(r)
 
 proj_name_by_id = {}
@@ -592,10 +619,10 @@ def parse_networks_pairs(val):
     out.append((ip, nn))
   return out
 
-def volume_label(vrow):
+def volume_meta(vrow):
   vid = str(get_ci(vrow, ["ID","id"], "") or "").strip()
   if not vid:
-    return ""
+    return None
   name = str(get_ci(vrow, ["Name","name"], "") or "").strip()
   size = get_ci(vrow, ["Size","size"], None)
 
@@ -606,12 +633,13 @@ def volume_label(vrow):
   except Exception:
     size_s = ""
 
-  if size_s and name and name.lower() == size_s.lower():
-    name = ""
-
+  # keep readable label
   if size_s:
-    return f"{size_s}({vid})" if not name else f"{name}:{size_s}({vid})"
-  return f"{vid}" if not name else f"{name}({vid})"
+    label = f"{size_s}({vid})" if not name else f"{name}:{size_s}({vid})"
+  else:
+    label = f"{vid}" if not name else f"{name}({vid})"
+
+  return {"id": vid, "id_norm": norm_id(vid), "label": label}
 
 def attached_server_ids(vrow):
   keys = ["Attachments","attachments","Attached to","Attached To","attached_to","AttachedTo","attachment"]
@@ -628,31 +656,36 @@ def attached_server_ids(vrow):
       if isinstance(it, dict):
         sid = it.get("server_id") or it.get("serverId") or it.get("server") or ""
         if sid:
-          ids.append(str(sid))
+          ids.append(norm_id(str(sid)))
   elif isinstance(raw, dict):
     sid = raw.get("server_id") or raw.get("server") or ""
     if sid:
-      ids.append(str(sid))
+      ids.append(norm_id(str(sid)))
   elif isinstance(raw, str):
-    ids.extend(UUID36.findall(raw))
-  return dedup(ids)
+    for m in ANY_UUID.findall(raw):
+      ids.append(norm_id(m))
 
+  return dedup([i for i in ids if i])
+
+# vols_by_server: key=normalized server id, value=list[meta]
 vols_by_server = {}
 for v in vols:
-  label = volume_label(v)
-  if not label:
+  meta = volume_meta(v)
+  if not meta:
     continue
-  for sid in attached_server_ids(v):
-    vols_by_server.setdefault(sid, [])
-    if label not in vols_by_server[sid]:
-      vols_by_server[sid].append(label)
+  for sid_norm in attached_server_ids(v):
+    vols_by_server.setdefault(sid_norm, [])
+    # dedup by volume id_norm
+    if not any(x["id_norm"] == meta["id_norm"] for x in vols_by_server[sid_norm]):
+      vols_by_server[sid_norm].append(meta)
 
 headers = ["ProjectName","ProjectID","InstanceName","InstanceID","Volume","IP","NetworkName","NetworkID","Status","PowerState"]
 blocks=[]
 
 for row in servers:
   sid = str(get_ci(row, ["ID","id"], "") or "").strip()
-  if not sid:
+  sid_norm = norm_id(sid)
+  if not sid_norm:
     continue
 
   sname = str(get_ci(row, ["Name","name"], "") or "").strip()
@@ -674,12 +707,14 @@ for row in servers:
   nets_val = get_ci(row, ["Networks","networks"], "") or ""
   ip_pairs = parse_networks_pairs(nets_val)
 
-  vol_list = dedup(vols_by_server.get(sid, []))
-  max_len = max(len(vol_list), len(ip_pairs), 1)
+  vol_metas = vols_by_server.get(sid_norm, [])
+  vol_labels = [m["label"] for m in vol_metas]
+
+  max_len = max(len(vol_labels), len(ip_pairs), 1)
 
   lines=[]
   for i in range(max_len):
-    vol = vol_list[i] if i < len(vol_list) else ""
+    vol = vol_labels[i] if i < len(vol_labels) else ""
     if i < len(ip_pairs):
       ip, net_name = ip_pairs[i]
       net_id = net_id_by_name.get(net_name, "") if net_name else ""
@@ -693,20 +728,37 @@ for row in servers:
 
   # Mode filter
   if mode == "id":
-    if not q:
+    if not q_norm:
       continue
-    sid_l = sid.lower()
-    if len(q) < 36:
-      if q not in sid_l:
+    # match normalized id (supports 32/36, with/without '-')
+    if len(q_norm) < len(sid_norm):
+      if q_norm not in sid_norm:
         continue
     else:
-      if q != sid_l:
+      if q_norm != sid_norm:
         continue
 
   elif mode == "name":
     if not q:
       continue
     if q not in sname.lower():
+      continue
+
+  elif mode == "vol":
+    if not q_norm:
+      continue
+    any_match = False
+    for m in vol_metas:
+      vid_n = m["id_norm"]
+      if len(q_norm) < len(vid_n):
+        if q_norm in vid_n:
+          any_match = True
+          break
+      else:
+        if q_norm == vid_n:
+          any_match = True
+          break
+    if not any_match:
       continue
 
   else:  # tokens
@@ -729,7 +781,7 @@ sep="  "
 def fmt(r):
   return sep.join(str(r[i]).ljust(w[i]) for i in range(len(w)))
 
-title = f"URIOSP INVENTORY VMS | profile={profile} | cloud={cloud} | time={datetime.datetime.now().isoformat(timespec='seconds')}"
+title = f"URIOSP LIST VMS | profile={profile} | cloud={cloud} | time={datetime.datetime.now().isoformat(timespec='seconds')}"
 line_w = max(term_cols, len(title))
 print(title)
 print("=" * line_w)
@@ -747,22 +799,36 @@ for _, lines in blocks:
 PY
 }
 
-cmd_list_cmd(){
-  local sub="${1:-}"
+cmd_list(){
+  local what="${1:-profiles}"
   shift || true
-  case "$sub" in
-    projects) log "INFO" "INVENTORY projects"; cmd_list_cmd_projects "$@" ;;
-    vms)      log "INFO" "INVENTORY vms";      cmd_list_cmd_vms "$@" ;;
-    ""|-h|--help|help)
+
+  case "$what" in
+    ""|profiles|profile)
+      cmd_list_profiles
+      ;;
+    projects|project)
+      log "INFO" "LIST projects"
+      cmd_list_projects "$@"
+      ;;
+    vms|vm|servers|server)
+      log "INFO" "LIST vms"
+      cmd_list_vms "$@"
+      ;;
+    -h|--help|help)
       cat <<EOF
 Usage:
-  $APP inventory projects [keyword...]
-  $APP inventory projects name <project_name_substring>
-  $APP inventory projects id <project_uuid_or_part>
+  $APP list
+  $APP list profiles
 
-  $APP inventory vms [keyword...]
-  $APP inventory vms name <vm_name_substring>
-  $APP inventory vms id <instance_uuid_or_part>
+  $APP list projects [keyword...]
+  $APP list projects name <project_name_substring>
+  $APP list projects id <project_id_or_part>
+
+  $APP list vms [keyword...]
+  $APP list vms name <vm_name_substring>
+  $APP list vms id <instance_id_or_part>
+  $APP list vms vol <volume_id_or_part>     # vol == volume id
 
 Session auth:
   eval "\$($APP auth)"
@@ -772,8 +838,15 @@ Notes:
   - Readonly: '$APP os' blocks mutating verbs.
 EOF
       ;;
-    *) die "Unknown inventory subcommand: $sub (use: projects|vms)" ;;
+    *)
+      die "Unknown list target: $what (use: profiles|projects|vms)"
+      ;;
   esac
+}
+
+# Backward-compat alias: inventory -> list
+cmd_inventory(){
+  cmd_list "$@"
 }
 
 cmd_logs(){
@@ -790,23 +863,23 @@ Session auth (no password stored in YAML):
 
 Commands:
   sudo $APP config <clouds.yaml>
-  $APP list
   $APP use <profile>
-  $APP auth
+  $APP list [profiles|projects|vms] ...
   $APP os <openstack ...>                 (readonly-guarded)
-  $APP inventory projects [keyword...]
-  $APP inventory vms [keyword...]
   $APP logs
+
+Legacy alias:
+  $APP inventory ...                      (same as: $APP list ...)
 EOF
 }
 
 case "${1:-}" in
   auth) shift; cmd_auth ;;
   config) shift; cmd_config "$@" ;;
-  list) shift; cmd_list ;;
   use) shift; cmd_use "$@" ;;
-  os) shift; cmd_os "$@" ;;
+  list) shift; cmd_list "$@" ;;
   inventory|inv) shift; cmd_inventory "$@" ;;
+  os) shift; cmd_os "$@" ;;
   logs) shift; cmd_logs ;;
   -h|--help|help|"") usage ;;
   *) die "Unknown command: $1 (use --help)" ;;
@@ -815,7 +888,15 @@ SH
 
 sudo chmod +x /usr/local/bin/uriosp
 
-
+# Idempotent permission bootstrap
+sudo groupadd -f uriosp
+sudo mkdir -p /etc/uriosp/profile /var/log/uriosp-logs
+sudo touch /etc/uriosp/active /var/log/uriosp-logs/uriosp.log
+sudo chown -R root:uriosp /etc/uriosp /var/log/uriosp-logs
+sudo chmod 0750 /etc/uriosp /etc/uriosp/profile
+sudo chmod 0640 /etc/uriosp/active
+sudo chmod 0770 /var/log/uriosp-logs
+sudo chmod 0660 /var/log/uriosp-logs/uriosp.log
 
 
 # Idempotent permission bootstrap
