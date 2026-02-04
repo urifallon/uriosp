@@ -221,7 +221,7 @@ cmd_list_projects(){
   OS_CLOUD="$DEFAULT_CLOUD" \
   OS_PASSWORD="${!SESSION_PASS_ENV}" \
   python3 - "$profile" "$DEFAULT_CLOUD" "$cfg" "$cfg_json_file" "$proj_json_file" "$mode" "$query" <<'PY'
-import sys, json, re, shutil, datetime
+import sys, os, json, re, shutil, datetime
 from pathlib import Path
 
 profile, cloud = sys.argv[1], sys.argv[2]
@@ -378,13 +378,25 @@ sep = "  "
 def fmt(r):
   return sep.join(str(r[i]).ljust(w[i]) for i in range(len(w)))
 
-title = f"URIOSP LIST PROJECTS | profile={profile} | cloud={cloud} | region={region} | endpoint={endpoint} | time={datetime.datetime.now().isoformat(timespec='seconds')}"
-line_w = max(term_cols, len(title))
-print(title)
-print("=" * line_w)
+title_raw = f"URIOSP LIST PROJECTS | profile={profile} | cloud={cloud} | region={region} | endpoint={endpoint} | time={datetime.datetime.now().isoformat(timespec='seconds')}"
+
+is_tty = sys.stdout.isatty()
+use_color = is_tty and os.environ.get("NO_COLOR") is None and os.environ.get("URIOSP_COLOR", "1") != "0"
+
+bg = os.environ.get("URIOSP_TITLE_BG", "44")
+fg = os.environ.get("URIOSP_TITLE_FG", "97")
+
+if is_tty:
+  line = f" {title_raw} "
+  pad = max(0, term_cols - len(line))
+  line = line + (" " * pad)
+else:
+  line = title_raw
+
+print(f"\033[1;{fg};{bg}m{line}\033[0m" if use_color else line)
 
 hdr = fmt(headers)
-line_w = max(line_w, len(hdr))
+line_w = term_cols
 print(hdr)
 print("-" * line_w)
 
@@ -453,7 +465,7 @@ cmd_list_vms(){
   OS_CLOUD="$DEFAULT_CLOUD" \
   OS_PASSWORD="${!SESSION_PASS_ENV}" \
   python3 - "$profile" "$DEFAULT_CLOUD" "$proj_json_file" "$net_json_file" "$srv_json_file" "$vol_json_file" "$mode" "$query" <<'PY'
-import sys, json, re, ast, shutil, datetime
+import sys, os, json, re, ast, shutil, datetime
 
 profile, cloud = sys.argv[1], sys.argv[2]
 proj_path, net_path, srv_path, vol_path = sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6]
@@ -781,13 +793,27 @@ sep="  "
 def fmt(r):
   return sep.join(str(r[i]).ljust(w[i]) for i in range(len(w)))
 
-title = f"URIOSP LIST VMS | profile={profile} | cloud={cloud} | time={datetime.datetime.now().isoformat(timespec='seconds')}"
-line_w = max(term_cols, len(title))
-print(title)
-print("=" * line_w)
+title_raw = f"URIOSP LIST VMS | profile={profile} | cloud={cloud} | time={datetime.datetime.now().isoformat(timespec='seconds')}"
+
+is_tty = sys.stdout.isatty()
+use_color = is_tty and os.environ.get("NO_COLOR") is None and os.environ.get("URIOSP_COLOR", "1") != "0"
+
+# default: blue bg (44), bright white fg (97)
+bg = os.environ.get("URIOSP_TITLE_BG", "44")
+fg = os.environ.get("URIOSP_TITLE_FG", "97")
+
+# pad to terminal width only when TTY
+if is_tty:
+  line = f" {title_raw} "
+  pad = max(0, term_cols - len(line))
+  line = line + (" " * pad)
+else:
+  line = title_raw
+
+print(f"\033[1;{fg};{bg}m{line}\033[0m" if use_color else line)
 
 hdr = fmt(headers)
-line_w = max(line_w, len(hdr))
+line_w = term_cols
 print(hdr)
 sep_line = "-" * line_w
 print(sep_line)
@@ -888,15 +914,6 @@ SH
 
 sudo chmod +x /usr/local/bin/uriosp
 
-# Idempotent permission bootstrap
-sudo groupadd -f uriosp
-sudo mkdir -p /etc/uriosp/profile /var/log/uriosp-logs
-sudo touch /etc/uriosp/active /var/log/uriosp-logs/uriosp.log
-sudo chown -R root:uriosp /etc/uriosp /var/log/uriosp-logs
-sudo chmod 0750 /etc/uriosp /etc/uriosp/profile
-sudo chmod 0640 /etc/uriosp/active
-sudo chmod 0770 /var/log/uriosp-logs
-sudo chmod 0660 /var/log/uriosp-logs/uriosp.log
 
 
 # Idempotent permission bootstrap
