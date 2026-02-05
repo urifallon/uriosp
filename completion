@@ -1,0 +1,65 @@
+sudo apt update
+sudo apt install -y bash-completion
+
+sudo tee /etc/bash_completion.d/uriosp >/dev/null <<'BASH'
+# Minimal bash completion for uriosp: only list + use
+
+_uriosp_profiles() {
+  local dir="/etc/uriosp/profile"
+  [[ -d "$dir" ]] || return 0
+  ls -1 "$dir" 2>/dev/null | sed -n 's/\.yaml$//p'
+}
+
+_uriosp_min() {
+  local cur prev
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+  # top-level: only list + use
+  if [[ $COMP_CWORD -eq 1 ]]; then
+    COMPREPLY=( $(compgen -W "list use" -- "$cur") )
+    return 0
+  fi
+
+  local cmd="${COMP_WORDS[1]}"
+
+  case "$cmd" in
+    list)
+      # uriosp list <TAB> => profiles projects vms
+      if [[ $COMP_CWORD -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "profiles projects vms" -- "$cur") )
+        return 0
+      fi
+
+      # optional: suggest filters for projects/vms
+      local sub="${COMP_WORDS[2]}"
+      if [[ $COMP_CWORD -eq 3 ]]; then
+        case "$sub" in
+          projects) COMPREPLY=( $(compgen -W "name id" -- "$cur") ) ;;
+          vms)      COMPREPLY=( $(compgen -W "name id vol" -- "$cur") ) ;;
+          *)        COMPREPLY=() ;;
+        esac
+        return 0
+      fi
+      ;;
+
+    use)
+      # uriosp use <TAB> => profiles from /etc/uriosp/profile/*.yaml
+      if [[ $COMP_CWORD -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "$(_uriosp_profiles)" -- "$cur") )
+        return 0
+      fi
+      ;;
+  esac
+
+  COMPREPLY=()
+}
+
+complete -F _uriosp_min uriosp
+BASH
+
+
+source /etc/bash_completion
+# hoặc mở terminal mới
+
+

@@ -1,21 +1,35 @@
+Dưới đây là **README đã cập nhật** theo đúng thay đổi bạn đang làm:
+
+* Đổi “inventory” → **`list`** (chức năng liệt kê/lọc projects & vms).
+* `uriosp list` **mặc định là list profiles**.
+* Giữ nguyên readonly-first + session auth.
+* Bổ sung filter cho `vms`: `name`, `id`, và **`vol <vol_id_or_part>`** (chỉ vol id, không vol name).
+* Thêm phần **màu header** qua `URIOSP_TITLE_BG/FG`.
+
+---
+
 # uriosp
 
 CLI hỗ trợ vận hành OpenStack theo hướng **readonly-first**:
-- Quản lý `clouds.yaml` theo profile (`/etc/uriosp/profile/*.yaml`)
-- Session auth qua env (không lưu password vào file)
-- Chế độ inventory có lọc theo **tokens / name / id**
-- Lệnh `uriosp os` có **readonly guard** (chặn các verb có khả năng thay đổi tài nguyên)
+
+* Quản lý `clouds.yaml` theo profile (`/etc/uriosp/profile/*.yaml`)
+* Session auth qua env (**không lưu password** vào file)
+* Lệnh `uriosp os` có **readonly guard** (chặn verb có khả năng mutate)
+* Lệnh `uriosp list` hỗ trợ lọc theo **tokens / name / id**
+
+  * riêng **VMS**: thêm lọc theo **`vol` (volume id)**
 
 ---
 
 ## 1) Cài đặt & phân quyền
 
 ### Thêm user vào group `uriosp`
+
 ```bash
 sudo usermod -aG uriosp "$USER"
 newgrp uriosp
 id | grep uriosp
-````
+```
 
 > Nếu chưa có group/layout, chạy bootstrap:
 
@@ -34,7 +48,7 @@ sudo chmod 0660 /var/log/uriosp-logs/uriosp.log
 
 ## 2) Cấu hình profile (clouds.yaml)
 
-### Nạp clouds.yaml vào profile và set active
+### Nạp `clouds.yaml` vào profile và set active
 
 ```bash
 sudo uriosp config <path/to/clouds.yaml>
@@ -49,7 +63,7 @@ sudo uriosp config duong.yaml
 ### Danh sách profile / chuyển profile
 
 ```bash
-uriosp list
+uriosp list             # list profiles
 uriosp use <profile>
 ```
 
@@ -61,7 +75,7 @@ uriosp use <profile>
 eval "$(uriosp auth)"
 ```
 
-* Password chỉ nằm trong **session env** (`URIOSP_OS_PASSWORD`)
+* Password chỉ nằm trong **session env**: `URIOSP_OS_PASSWORD`
 * Mở terminal mới thì cần chạy lại `eval "$(uriosp auth)"`
 
 ---
@@ -75,43 +89,69 @@ uriosp os token issue
 uriosp os server list --all-projects
 ```
 
-> Nếu lệnh bị chặn: tức là verb bị coi là mutating (create/delete/set/attach/...) và tool đang readonly.
+> Nếu lệnh bị chặn: verb bị coi là mutating (create/delete/set/attach/...) và tool đang readonly.
 
 ---
 
-## 5) Inventory
+## 5) List (projects / vms)
 
-### Liệt kê toàn bộ
+### 5.1 Liệt kê toàn bộ
 
 ```bash
-uriosp inventory vms
-uriosp inventory projects
+uriosp list projects
+uriosp list vms
 ```
 
-### Lọc theo tokens (AND)
+### 5.2 Lọc theo tokens (AND)
 
 ```bash
-uriosp inventory vms my-vm 10.10
-uriosp inventory projects admin Enabled
+uriosp list vms my-vm 10.10
+uriosp list projects admin Enabled
 ```
 
-### Lọc theo name
+### 5.3 Lọc theo name
 
 ```bash
-uriosp inventory vms name <name>
-uriosp inventory projects name <name>
+uriosp list vms name <vm_name_substring>
+uriosp list projects name <project_name_substring>
 ```
 
-### Lọc theo id (UUID hoặc partial)
+### 5.4 Lọc theo id (UUID hoặc partial)
 
 ```bash
-uriosp inventory vms id <id>
-uriosp inventory projects id <id>
+uriosp list vms id <instance_uuid_or_part>
+uriosp list projects id <project_uuid_or_part>
+```
+
+### 5.5 Lọc VMS theo volume id (`vol`)
+
+> `vol` = volume **ID** hoặc partial ID. Không hỗ trợ volume name.
+
+```bash
+uriosp list vms vol <volume_uuid_or_part>
 ```
 
 ---
 
-## Quick start (tóm tắt)
+## 6) Tùy chọn màu header (optional)
+
+Bạn có thể tô nền title line cho `list projects/vms` bằng ANSI color:
+
+```bash
+URIOSP_TITLE_BG=45 URIOSP_TITLE_FG=97 uriosp list vms
+```
+
+* `URIOSP_TITLE_BG`: mã màu nền (vd `45` = tím)
+* `URIOSP_TITLE_FG`: mã màu chữ (vd `97` = trắng)
+* Có thể tắt màu:
+
+```bash
+URIOSP_COLOR=0 uriosp list vms
+```
+
+---
+
+## Quick start
 
 ```bash
 sudo usermod -aG uriosp "$USER"
@@ -121,11 +161,15 @@ sudo uriosp config duong.yaml
 eval "$(uriosp auth)"
 
 uriosp os token issue
-uriosp inventory vms
-uriosp inventory vms name my-vm
-uriosp inventory vms id addadf10
 
-uriosp inventory projects
-uriosp inventory projects name admin
-uriosp inventory projects id df20f3b2
+uriosp list
+uriosp list vms
+uriosp list vms name my-vm
+uriosp list vms id addadf10
+uriosp list vms vol 3a1b2c
+
+uriosp list projects
+uriosp list projects name admin
+uriosp list projects id df20f3b2
 ```
+
